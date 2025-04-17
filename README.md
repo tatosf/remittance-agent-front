@@ -1,8 +1,6 @@
-# TXT2TXN Frontend
+# remittance agent Frontend
 
-This repo serves as the frontend for the TXT2TXN project.
-
-TXT2TXN is a collaboration between Circle and Blockchain at Berkeley, in particular [Niall Mandal](https://github.com/niallmandal).
+This repo serves as the frontend for the Brinco project.
 
 ## Setup
 
