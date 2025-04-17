@@ -644,7 +644,7 @@ async function createLiquidityPoolIfNeeded(
 
 // MoonPay URLs
 const MOONPAY_BASE_URL = "https://buy.moonpay.com";
-const MOONPAY_API_KEY = "pk_test_1234567890"; // Replace with your actual publishable API key
+const MOONPAY_API_KEY = "pk_live_YOUR_ACTUAL_MOONPAY_KEY"; 
 
 /**
  * Processes a fiat-to-crypto purchase request by creating a MoonPay widget URL
@@ -718,4 +718,41 @@ export async function processBuyRequest(
   return {
     moonpayUrl: moonpayUrl
   };
+}
+
+export async function sendRemittanceTransaction(
+  wallets: ConnectedWallet[],
+  txData: any,
+  chain: string
+): Promise<ethers.providers.TransactionResponse> {
+  if (!wallets[0]) {
+    throw new Error("No wallet is connected!");
+  }
+
+  const chainId = supportedChains[chain];
+  if (chainId === undefined) {
+    throw new Error("Unsupported chain");
+  }
+
+  await wallets[0].switchChain(chainId);
+  const provider = await wallets[0].getEthersProvider();
+  const signer = provider.getSigner();
+  const userAddress = await signer.getAddress();
+
+  // Prepare the transaction for signing
+  const tx = {
+    to: txData.to,
+    from: userAddress,
+    data: txData.data,
+    value: txData.value || 0,
+    gasLimit: ethers.BigNumber.from(txData.gas || 300000),
+    gasPrice: ethers.BigNumber.from(txData.gasPrice || (await provider.getGasPrice())),
+    chainId: chainId,
+    nonce: txData.nonce !== undefined ? 
+      txData.nonce : 
+      await provider.getTransactionCount(userAddress, "latest")
+  };
+
+  console.log("Sending remittance transaction:", tx);
+  return await signer.sendTransaction(tx);
 }

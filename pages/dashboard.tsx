@@ -20,7 +20,6 @@
  *
  * SPDX-License-Identifier: MIT
  */
-
 import { useRouter } from "next/router";
 import React, { useEffect, useState } from "react";
 import { usePrivy, useWallets } from "@privy-io/react-auth";
@@ -37,12 +36,18 @@ import {
 } from "../util/utils";
 import { ethers } from "ethers";
 import { OrderStatus } from "@cowprotocol/cow-sdk";
+import { encode_abi } from "eth-abi";
 
-// Define the transaction history item interface
+const ERC20_ABI = [
+  "function balanceOf(address owner) view returns (uint256)",
+  "function decimals() view returns (uint8)",
+  "function symbol() view returns (string)"
+];
+
 interface TransactionHistoryItem {
   id: string;
   timestamp: number;
-  type: "transfer" | "swap" | "buy";
+  type: "transfer" | "swap" | "buy" | "remittance";
   status: "pending" | "completed" | "failed";
   data: {
     transactionHash?: string;
@@ -53,8 +58,17 @@ interface TransactionHistoryItem {
     recipientAddress?: string;
     orderId?: string;
     moonpayUrl?: string;
+    exchangeRates?: any;
+    fees?: any;
   };
   message: string;
+}
+
+interface TokenBalance {
+  address: string;
+  symbol: string;
+  balance: string;
+  decimals: number;
 }
 
 export default function DashboardPage() {
@@ -66,6 +80,11 @@ export default function DashboardPage() {
   const [transactionHistory, setTransactionHistory] = useState<TransactionHistoryItem[]>([]);
   const [networkError, setNetworkError] = useState<string | null>(null);
   const [showHistory, setShowHistory] = useState<boolean>(false);
+  const [remittanceCost, setRemittanceCost] = useState<any>(null);
+  const [showCostSimulation, setShowCostSimulation] = useState<boolean>(false);
+  const [tokenBalances, setTokenBalances] = useState<Record<string, TokenBalance>>({});
+  const [currentRemittanceStep, setCurrentRemittanceStep] = useState<number>(1);
+  const [remittanceFlowData, setRemittanceFlowData] = useState<any>(null);
   
   const router = useRouter();
   const { ready, authenticated, logout } = usePrivy();
@@ -98,6 +117,30 @@ export default function DashboardPage() {
     }
   }, [transactionHistory]);
 
+  useEffect(() => {
+    if (remittanceFlowData) {
+      localStorage.setItem("brinco_remittance_flow", JSON.stringify({
+        data: remittanceFlowData,
+        step: currentRemittanceStep
+      }));
+    }
+  }, [remittanceFlowData, currentRemittanceStep]);
+
+  useEffect(() => {
+    if (ready && authenticated) {
+      const storedFlowData = localStorage.getItem("brinco_remittance_flow");
+      if (storedFlowData) {
+        try {
+          const parsedData = JSON.parse(storedFlowData);
+          setRemittanceFlowData(parsedData.data);
+          setCurrentRemittanceStep(parsedData.step);
+        } catch (e) {
+          console.error("Failed to parse stored remittance flow data:", e);
+        }
+      }
+    }
+  }, [ready, authenticated]);
+
   const { wallets } = useWallets();
   
   // Function to add a new transaction to history
@@ -120,7 +163,6 @@ export default function DashboardPage() {
     );
   };
   
-  // Function to check network connectivity
   const checkNetwork = async (chain: string) => {
     if (!wallets[0]) {
       throw new Error("No wallet connected");
@@ -171,7 +213,693 @@ export default function DashboardPage() {
     }
   };
 
-  // Modify queryIntent to include network check
+  const checkTokenBalance = async (tokenAddress: string, walletAddress: string) => {
+    try {
+      if (!wallets[0]) {
+        throw new Error("No wallet connected");
+      }
+      
+      const provider = await wallets[0].getEthersProvider();
+      const tokenContract = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
+      
+      const balance = await tokenContract.balanceOf(walletAddress);
+      const decimals = await tokenContract.decimals();
+      const symbol = await tokenContract.symbol();
+      
+      const formattedBalance = ethers.utils.formatUnits(balance, decimals);
+      
+      // Update the token balances state
+      setTokenBalances(prev => ({
+        ...prev,
+        [tokenAddress]: {
+          address: tokenAddress,
+          symbol: symbol,
+          balance: formattedBalance,
+          decimals: decimals
+        }
+      }));
+      
+      return formattedBalance;
+    } catch (error) {
+      console.error("Failed to check token balance:", error);
+      return "0";
+    }
+  };
+
+  // Function to execute a transaction step
+  const executeRemittanceStep = async (stepData: any) => {
+    try {
+      if (!wallets[0]) {
+        throw new Error("No wallet connected");
+      }
+      
+      // Get the current wallet address - this is key to fixing the error
+      const walletAddress = wallets[0].address;
+      console.log("🔍 Starting executeRemittanceStep with wallet address:", walletAddress);
+      
+      if (stepData.check_balance) {
+        console.log("📊 Executing balance check for token:", stepData.check_balance.token_address);
+        const balance = await checkTokenBalance(
+          stepData.check_balance.token_address,
+          walletAddress // Always use the user's wallet
+        );
+        
+        return {
+          success: true,
+          type: "balance_check",
+          balance
+        };
+      }
+      
+      if (!stepData.requires_signature) {
+        // No signature required, just return success
+        console.log("✅ Step doesn't require signature, returning success");
+        return {
+          success: true,
+          type: "no_signature_required"
+        };
+      }
+      
+      // Execute the transaction
+      const provider = await wallets[0].getEthersProvider();
+      console.log("🔗 Connected to blockchain provider, network:", await provider.getNetwork());
+      const signer = provider.getSigner();
+      
+      // Create a new transaction object with the correct from address
+      const txData = { 
+        ...stepData.tx_data,
+        from: walletAddress // Override the placeholder with actual wallet address
+      };
+      
+      // Fix for ethers.js: Convert 'gas' to 'gasLimit' and remove 'gas'
+      if (txData.gas) {
+        txData.gasLimit = txData.gas;
+        delete txData.gas;
+      }
+      
+      console.log("📝 Preparing to send transaction with data:", JSON.stringify(txData, null, 2));
+      
+      // Send the transaction with the corrected data
+      console.log("🚀 Sending transaction...");
+      const tx = await signer.sendTransaction(txData);
+      console.log("📨 Transaction sent! Hash:", tx.hash);
+      console.log("📊 Transaction details:", JSON.stringify(tx, null, 2));
+      
+      // Set loading state to show transaction is being processed
+      setLoading(true);
+      setStatus(
+        <div className="text-center">
+          <h3 className="text-xl font-semibold mb-4">Transaction Submitted</h3>
+          <div className="bg-secondary/20 p-4 rounded-lg mb-4">
+            <p className="mb-2">Your transaction has been submitted and is being processed.</p>
+            <p className="text-sm text-gray-400">Transaction hash: {tx.hash}</p>
+            <div className="mt-4 flex justify-center">
+              <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-primary"></div>
+            </div>
+          </div>
+          <p className="text-sm text-gray-400">Please wait, this may take up to a minute...</p>
+        </div>
+      );
+      
+      // Wait for one confirmation with a timeout to prevent hanging
+      console.log("⏱️ Waiting for transaction confirmation...");
+      
+      // Create a promise that rejects after timeout
+      const timeout = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Transaction confirmation timeout after 60 seconds")), 60000)
+      );
+      
+      // Race between the transaction confirmation and the timeout
+      try {
+        const receipt = await Promise.race([
+          tx.wait(1),
+          timeout
+        ]) as ethers.providers.TransactionReceipt;
+        
+        console.log("✅ Transaction confirmed! Receipt:", JSON.stringify(receipt, null, 2));
+        return {
+          success: true,
+          type: "transaction",
+          hash: receipt.transactionHash
+        };
+      } catch (timeoutError) {
+        console.error("⏱️ Transaction wait timed out or failed:", timeoutError);
+        
+        // Even if waiting times out, the transaction might still complete successfully later
+        console.log("🔍 Checking transaction status directly...");
+        try {
+          const latestStatus = await provider.getTransaction(tx.hash);
+          console.log("📊 Latest transaction status:", JSON.stringify(latestStatus, null, 2));
+          
+          if (latestStatus && latestStatus.blockNumber) {
+            console.log("✅ Transaction was mined in block:", latestStatus.blockNumber);
+            return {
+              success: true,
+              type: "transaction",
+              hash: tx.hash,
+              note: "Confirmed via direct check after timeout"
+            };
+          } else {
+            console.log("⏳ Transaction still pending after timeout");
+            return {
+              success: true,
+              type: "transaction",
+              hash: tx.hash,
+              pending: true,
+              note: "Transaction submitted but confirmation timed out. It may still complete later."
+            };
+          }
+        } catch (statusCheckError) {
+          console.error("❌ Failed to check transaction status:", statusCheckError);
+          throw new Error(`Transaction submitted (${tx.hash}) but confirmation status unknown: ${timeoutError}`);
+        }
+      }
+    } catch (error) {
+      console.error("❌ Failed to execute remittance step:", error);
+      
+      // Check if it's a user rejection
+      let errorMessage = error instanceof Error ? error.message : "Unknown error";
+      console.error("❌ Error details:", errorMessage);
+      
+      if (errorMessage.includes("user rejected") || errorMessage.includes("User denied")) {
+        console.log("🚫 Transaction was rejected by user");
+        return {
+          success: false,
+          error: "Transaction was rejected in your wallet. Please try again.",
+          userRejected: true
+        };
+      }
+      
+      return {
+        success: false,
+        error: errorMessage
+      };
+    }
+  };
+
+  // Add a utility function to check transaction status
+  const checkTransactionStatus = async (txHash: string, chain: string) => {
+    try {
+      if (!wallets[0]) {
+        throw new Error("No wallet connected");
+      }
+      
+      console.log("🔍 Manually checking transaction status for hash:", txHash);
+      
+      // Ensure we're on the right network
+      await checkNetwork(chain);
+      
+      const provider = await wallets[0].getEthersProvider();
+      
+      // First check if the transaction is in the mempool
+      const tx = await provider.getTransaction(txHash);
+      console.log("📊 Transaction details:", tx ? JSON.stringify(tx, null, 2) : "Not found");
+      
+      if (!tx) {
+        return { found: false, status: "not_found" };
+      }
+      
+      // If the transaction has a blockNumber, it has been mined
+      if (tx.blockNumber) {
+        // Now get the receipt to check status
+        const receipt = await provider.getTransactionReceipt(txHash);
+        console.log("📝 Transaction receipt:", receipt ? JSON.stringify(receipt, null, 2) : "Receipt not found");
+        
+        if (receipt) {
+          // status: 1 = success, 0 = failure
+          return { 
+            found: true, 
+            mined: true, 
+            successful: receipt.status === 1,
+            blockNumber: receipt.blockNumber,
+            receipt: receipt
+          };
+        }
+        
+        // Transaction mined but no receipt yet
+        return { found: true, mined: true, blockNumber: tx.blockNumber };
+      }
+      
+      // Transaction found but not yet mined
+      return { found: true, mined: false, status: "pending" };
+      
+    } catch (error) {
+      console.error("❌ Error checking transaction status:", error);
+      return { found: false, error: error instanceof Error ? error.message : "Unknown error" };
+    }
+  };
+
+  // Add a helper function to process the next step explicitly
+  const processNextStep = (flowData: any, nextStepNumber: number) => {
+    console.log(`🔼 Explicitly processing next step: ${nextStepNumber} (current state value: ${currentRemittanceStep})`);
+    // Update the step in state
+    setCurrentRemittanceStep(nextStepNumber);
+    console.log(`🔄 State update requested: currentRemittanceStep → ${nextStepNumber}`);
+    
+    // Update in localStorage to ensure persistence
+    localStorage.setItem("brinco_remittance_flow", JSON.stringify({
+      data: flowData,
+      step: nextStepNumber
+    }));
+    console.log(`💾 localStorage updated with step ${nextStepNumber}`);
+    
+    // Process with the updated step - pass the nextStepNumber directly
+    console.log(`⏱️ Setting timeout to process step ${nextStepNumber} in 100ms`);
+    setTimeout(() => {
+      console.log(`⏰ Timeout fired! Processing step ${nextStepNumber} now`);
+      processRemittanceFlow(flowData, nextStepNumber);
+    }, 100);
+  };
+
+  // Function to handle the remittance process
+  const processRemittanceFlow = async (flowData: any, forceStep?: number) => {
+    if (!flowData || !flowData.transaction_flow) {
+      console.log("❌ No flow data available to process");
+      return;
+    }
+    
+    const totalSteps = Object.keys(flowData.transaction_flow).length;
+    
+    // Validate that the current step is valid
+    // Use forceStep if provided, otherwise fall back to state
+    let currentStep = forceStep !== undefined ? forceStep : currentRemittanceStep;
+    console.log(`🔄 Initial step from state: ${currentStep} of ${totalSteps}`);
+    
+    // If current step is invalid (less than 1 or greater than total), reset to 1
+    if (currentStep < 1 || currentStep > totalSteps) {
+      console.log(`⚠️ Invalid step detected: ${currentStep}. Resetting to step 1`);
+      currentStep = 1;
+      setCurrentRemittanceStep(1);
+      // Update localStorage to ensure consistency
+      localStorage.setItem("brinco_remittance_flow", JSON.stringify({
+        data: flowData,
+        step: 1
+      }));
+    }
+    
+    console.log(`🔄 Processing remittance flow: Step ${currentStep} of ${totalSteps}`);
+    console.log(`🔍 Current step being processed: ${currentStep}`);
+    
+    // Check initial token balances if using test tokens
+    if (flowData.using_test_tokens && flowData.token_addresses && wallets[0]?.address) {
+      console.log("📊 Checking initial token balances");
+      await checkTokenBalance(flowData.token_addresses.tUSD, wallets[0].address);
+      await checkTokenBalance(flowData.token_addresses.tEUR, wallets[0].address);
+    }
+    
+    // Start processing the steps
+    if (currentStep <= totalSteps) {
+      const stepKey = `step${currentStep}`;
+      const stepData = flowData.transaction_flow[stepKey];
+      
+      if (!stepData) {
+        console.log(`❌ No data found for step ${currentStep}`);
+        return;
+      }
+      
+      console.log(`🔍 Processing step ${currentStep}: ${stepData.name}`);
+      console.log(`📝 Step data:`, JSON.stringify(stepData, null, 2));
+      
+      // Update UI to indicate current step
+      setStatus(
+        <div className="text-center">
+          <h3 className="text-xl font-semibold mb-4">Remittance Process</h3>
+          <div className="bg-secondary/20 p-4 rounded-lg mb-4">
+            <p className="mb-2">
+              Step {currentStep} of {totalSteps}: {stepData.name}
+            </p>
+            <p className="text-sm text-gray-400 mb-2">{stepData.description}</p>
+            {stepData.explain && (
+              <p className="text-xs text-gray-500 mb-4">{stepData.explain}</p>
+            )}
+            <div className="w-full bg-gray-700 h-2 rounded-full overflow-hidden">
+              <div 
+                className="bg-primary h-full"
+                style={{ width: `${(currentStep / totalSteps) * 100}%` }}
+              ></div>
+            </div>
+          </div>
+          
+          {/* Display token balances if available */}
+          {Object.keys(tokenBalances).length > 0 && (
+            <div className="mt-4 p-4 bg-gray-900 rounded-lg border border-gray-800">
+              <h4 className="text-primary font-medium mb-2">Token Balances</h4>
+              <div className="grid grid-cols-2 gap-2">
+                {Object.values(tokenBalances).map((token) => (
+                  <div key={token.address} className="flex justify-between items-center">
+                    <span>{token.symbol}:</span>
+                    <span className="font-mono">{parseFloat(token.balance).toFixed(4)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          
+          <div className="mt-4">
+            <button
+              onClick={() => executeCurrentStep()}
+              className="btn-primary"
+              disabled={loading}
+            >
+              {loading ? "Processing..." : `Execute Step ${currentStep}`}
+            </button>
+            {/* Add a Cancel button to allow exiting the process */}
+            <button
+              onClick={() => {
+                // Clear remittance data from localStorage when canceling
+                localStorage.removeItem("brinco_remittance_flow");
+                setRemittanceFlowData(null);
+                setCurrentRemittanceStep(1);
+                setShowStatusPopup(false);
+              }}
+              className="btn-secondary ml-2"
+              disabled={loading}
+            >
+              Cancel Process
+            </button>
+          </div>
+        </div>
+      );
+      
+      // Wait for user to execute the step
+      const executeCurrentStep = async () => {
+        setLoading(true);
+        console.log(`▶️ Executing step ${currentStep}: ${stepData.name}`);
+        const result = await executeRemittanceStep(stepData);
+        console.log(`📊 Step ${currentStep} execution result:`, JSON.stringify(result, null, 2));
+        setLoading(false);
+        
+        if (result.success) {
+          // If there's a pending transaction hash, double-check its status
+          if (result.pending && result.hash) {
+            console.log("⏳ Transaction appears to be pending, checking status...");
+            
+            setStatus(
+              <div className="text-center">
+                <h3 className="text-xl font-semibold mb-4">Checking Transaction Status</h3>
+                <div className="bg-secondary/20 p-4 rounded-lg mb-4">
+                  <p className="mb-2">Please wait while we check the status of your transaction...</p>
+                  <div className="mt-4 flex justify-center">
+                    <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-primary"></div>
+                  </div>
+                </div>
+              </div>
+            );
+            
+            // Wait a bit for the transaction to propogate
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            
+            // Check transaction status
+            const txStatus = await checkTransactionStatus(result.hash, "sepolia");
+            console.log("📊 Manual transaction status check result:", JSON.stringify(txStatus, null, 2));
+            
+            if (txStatus.mined && txStatus.successful) {
+              // Transaction succeeded!
+              console.log("✅ Transaction was successful despite the timeout!");
+              
+              // Update the transaction history
+              const stepInfo = flowData.transaction_flow[`step${currentStep}`];
+              const stepName = typeof stepInfo === 'object' && stepInfo !== null && 'name' in stepInfo 
+                ? String(stepInfo.name) 
+                : "Transaction";
+                
+              addTransactionToHistory({
+                type: "remittance",
+                status: "completed",
+                data: {
+                  transactionHash: result.hash,
+                  chain: "sepolia",
+                  amount: flowData.amount?.toString() || "0",
+                  recipientAddress: flowData.recipient_address || "",
+                },
+                message: `Completed remittance step ${currentStep}: ${stepName}`
+              });
+              
+              // Update balances if using test tokens
+              if (flowData.using_test_tokens && flowData.token_addresses && wallets[0]?.address) {
+                await checkTokenBalance(flowData.token_addresses.tUSD, wallets[0].address);
+                await checkTokenBalance(flowData.token_addresses.tEUR, wallets[0].address);
+              }
+              
+              // Show success and provide Next Step button
+              setStatus(
+                <div className="text-center">
+                  <h3 className="text-xl font-semibold mb-4">Step Completed</h3>
+                  <div className="bg-green-100 p-4 rounded-lg mb-4">
+                    <p className="text-green-800">✅ Transaction successful!</p>
+                    <a
+                      className="text-primary hover:text-primary/80 underline block mt-2"
+                      href={`${chainToUrl.sepolia}${result.hash}`}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      View on Explorer: {abbreviateTransactionHash(result.hash || '')}
+                    </a>
+                  </div>
+                  <button
+                    onClick={() => {
+                      const nextStep = currentStep + 1;
+                      // Use the explicit function to process the next step
+                      processNextStep(flowData, nextStep);
+                    }}
+                    className="btn-primary"
+                  >
+                    Next Step
+                  </button>
+                </div>
+              );
+              
+              return;
+            } else if (txStatus.found && !txStatus.mined) {
+              // Transaction is still in the mempool/pending
+              console.log("⏳ Transaction is still pending in the mempool");
+            } else {
+              // Transaction might be dropped or failed
+              console.log("⚠️ Transaction might be dropped or failed");
+            }
+          }
+          
+          // Handle pending transactions
+          if (result.pending) {
+            console.log("⏳ Transaction is pending. Providing user option to continue or wait.");
+            setStatus(
+              <div className="text-center">
+                <h3 className="text-xl font-semibold mb-4">Transaction Pending</h3>
+                <div className="bg-yellow-50 p-4 rounded-lg mb-4">
+                  <p className="text-yellow-800">
+                    ⚠️ Your transaction was submitted, but confirmation is taking longer than expected.
+                  </p>
+                  <p className="text-sm mt-2">Transaction hash: {result.hash}</p>
+                  <a
+                    className="text-primary hover:text-primary/80 underline block mt-2"
+                    href={`${chainToUrl.sepolia}${result.hash}`}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    View on Explorer: {result.hash ? abbreviateTransactionHash(result.hash || '') : ''}
+                  </a>
+                </div>
+                <div className="flex justify-center space-x-4">
+                  <button
+                    onClick={() => {
+                      console.log("👉 User chose to continue to next step anyway");
+                      const nextStep = currentStep + 1;
+                      // Use the explicit function to process the next step
+                      processNextStep(flowData, nextStep);
+                    }}
+                    className="btn-primary"
+                  >
+                    Next Step
+                  </button>
+                  <button
+                    onClick={() => {
+                      console.log("🔄 User chose to try this step again");
+                      processRemittanceFlow(flowData, currentStep);
+                    }}
+                    className="btn-secondary"
+                  >
+                    Try Again
+                  </button>
+                </div>
+              </div>
+            );
+            return;
+          }
+          
+          // Update the UI based on result type
+          if (result.type === "balance_check") {
+            // Just update the status to show the next step
+            setStatus(
+              <div className="text-center">
+                <h3 className="text-xl font-semibold mb-4">Balance Check Complete</h3>
+                <div className="bg-green-100 p-4 rounded-lg mb-4">
+                  <p className="text-green-800">
+                    ✅ Balance check complete! You have {result.balance} tokens.
+                  </p>
+                </div>
+                <button
+                  onClick={() => {
+                    const nextStep = currentStep + 1;
+                    // Use the explicit function to process the next step
+                    processNextStep(flowData, nextStep);
+                  }}
+                  className="btn-primary"
+                >
+                  Next Step
+                </button>
+              </div>
+            );
+          } else if (result.type === "transaction") {
+            // Update the transaction history
+            const stepInfo = flowData.transaction_flow[`step${currentStep}`];
+            const stepName = typeof stepInfo === 'object' && stepInfo !== null && 'name' in stepInfo 
+              ? String(stepInfo.name) 
+              : "Transaction";
+              
+            addTransactionToHistory({
+              type: "remittance",
+              status: "completed",
+              data: {
+                transactionHash: result.hash,
+                chain: "sepolia",
+                amount: flowData.amount?.toString() || "0",
+                recipientAddress: flowData.recipient_address || "",
+              },
+              message: `Completed remittance step ${currentStep}: ${stepName}`
+            });
+            
+            // Update balances if using test tokens
+            if (flowData.using_test_tokens && flowData.token_addresses && wallets[0]?.address) {
+              await checkTokenBalance(flowData.token_addresses.tUSD, wallets[0].address);
+              await checkTokenBalance(flowData.token_addresses.tEUR, wallets[0].address);
+            }
+            
+            // Show success and proceed to next step with button
+            setStatus(
+              <div className="text-center">
+                <h3 className="text-xl font-semibold mb-4">Step Completed</h3>
+                <div className="bg-green-100 p-4 rounded-lg mb-4">
+                  <p className="text-green-800">✅ Transaction successful!</p>
+                  <a
+                    className="text-primary hover:text-primary/80 underline block mt-2"
+                    href={`${chainToUrl.sepolia}${result.hash}`}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    View on Explorer: {abbreviateTransactionHash(result.hash || '')}
+                  </a>
+                </div>
+                <button
+                  onClick={() => {
+                    const nextStep = currentStep + 1;
+                    // Use the explicit function to process the next step
+                    processNextStep(flowData, nextStep);
+                  }}
+                  className="btn-primary"
+                >
+                  Next Step
+                </button>
+              </div>
+            );
+          } else {
+            // No signature required or other case
+            // Show success and proceed to next step with button
+            setStatus(
+              <div className="text-center">
+                <h3 className="text-xl font-semibold mb-4">Step Completed</h3>
+                <div className="bg-green-100 p-4 rounded-lg mb-4">
+                  <p className="text-green-800">✅ Step completed successfully!</p>
+                </div>
+                <button
+                  onClick={() => {
+                    const nextStep = currentStep + 1;
+                    // Use the explicit function to process the next step
+                    processNextStep(flowData, nextStep);
+                  }}
+                  className="btn-primary"
+                >
+                  Next Step
+                </button>
+              </div>
+            );
+          }
+          
+          return; // Exit this iteration, the next step will be handled when user clicks the Next Step button
+        } else {
+          // Show error
+          setStatus(
+            <div className="text-center">
+              <h3 className="text-xl font-semibold mb-4 text-red-600">Step Failed</h3>
+              <div className="bg-red-50 p-4 rounded-lg mb-4">
+                <p className="text-red-700">Failed to execute step {currentStep}.</p>
+                <p className="text-sm text-gray-600 mt-2">{result.error}</p>
+              </div>
+              <button
+                onClick={() => processRemittanceFlow(flowData, currentStep)}
+                className="btn-primary"
+              >
+                Try Again
+              </button>
+            </div>
+          );
+          return; // Exit and wait for user to try again
+        }
+      };
+      
+      // Wait for the async operation to complete before continuing
+      return;
+    }
+    
+    // If we've reached here, all steps are complete
+    if (currentStep > totalSteps) {
+      setStatus(
+        <div className="text-center">
+          <h3 className="text-xl font-semibold mb-4">Remittance Complete</h3>
+          <div className="bg-green-100 p-4 rounded-lg mb-4">
+            <p className="text-green-800">
+              ✅ Remittance process completed successfully!
+            </p>
+            {flowData.using_test_tokens && (
+              <p className="text-sm mt-2">
+                You now have tEUR tokens in your wallet representing the euros that would
+                be sent to the recipient in a real remittance.
+              </p>
+            )}
+          </div>
+          
+          {/* Display final token balances */}
+          {Object.keys(tokenBalances).length > 0 && (
+            <div className="mt-4 p-4 bg-gray-900 rounded-lg border border-gray-800">
+              <h4 className="text-primary font-medium mb-2">Final Token Balances</h4>
+              <div className="grid grid-cols-2 gap-2">
+                {Object.values(tokenBalances).map((token) => (
+                  <div key={token.address} className="flex justify-between items-center">
+                    <span>{token.symbol}:</span>
+                    <span className="font-mono">{parseFloat(token.balance).toFixed(4)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          
+          <button
+            onClick={() => {
+              // Clear remittance data from localStorage when done
+              localStorage.removeItem("brinco_remittance_flow");
+              setRemittanceFlowData(null);
+              setCurrentRemittanceStep(1);
+              setShowStatusPopup(false);
+            }}
+            className="btn-primary mt-4"
+          >
+            Done
+          </button>
+        </div>
+      );
+    }
+  };
+
+  // Modify queryIntent to include the test token parameter and handle remittance
   const queryIntent = async () => {
     setNetworkError(null);
     let data: any;
@@ -182,7 +910,10 @@ export default function DashboardPage() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ question: intentValue }),
+        body: JSON.stringify({ 
+          question: intentValue,
+          use_test_tokens: true // Always use test tokens
+        }),
       });
       if (!response.ok) {
         throw new Error("Network response was not ok!");
@@ -250,7 +981,7 @@ export default function DashboardPage() {
                   target="_blank"
                   rel="noreferrer"
                 >
-                  View on Explorer: {abbreviateTransactionHash(tx.hash)}
+                  View on Explorer: {abbreviateTransactionHash(tx.hash || '')}
                 </a>
               </div>
             </div>
@@ -265,7 +996,7 @@ export default function DashboardPage() {
             updateTransactionInHistory(historyId, {
               status: "completed",
               data: { transactionHash: receipt.transactionHash },
-              message: `Successfully transferred ${amount} tokens to ${recipientAddress}. View on explorer: ${abbreviateTransactionHash(receipt.transactionHash)}`,
+              message: `Successfully transferred ${amount} tokens to ${recipientAddress}. View on explorer: ${abbreviateTransactionHash(receipt.transactionHash || '')}`,
             });
 
             setStatus(
@@ -279,7 +1010,7 @@ export default function DashboardPage() {
                     target="_blank"
                     rel="noreferrer"
                   >
-                    View on Explorer: {abbreviateTransactionHash(receipt.transactionHash)}
+                    View on Explorer: {abbreviateTransactionHash(receipt.transactionHash || '')}
                   </a>
                 </div>
               </div>
@@ -290,7 +1021,7 @@ export default function DashboardPage() {
             // Even if confirmation monitoring fails, the transaction might still go through
             updateTransactionInHistory(historyId, {
               status: "pending",
-              message: `Transfer submitted but confirmation status unknown. View on explorer: ${abbreviateTransactionHash(tx.hash)}`,
+              message: `Transfer submitted but confirmation status unknown. View on explorer: ${abbreviateTransactionHash(tx.hash || '')}`,
             });
             
             setStatus(
@@ -305,7 +1036,7 @@ export default function DashboardPage() {
                     target="_blank"
                     rel="noreferrer"
                   >
-                    View on Explorer: {abbreviateTransactionHash(tx.hash)}
+                    View on Explorer: {abbreviateTransactionHash(tx.hash || '')}
                   </a>
                 </div>
               </div>
@@ -474,7 +1205,7 @@ export default function DashboardPage() {
           updateTransactionInHistory(historyId, {
             status: "pending",
             data: { transactionHash: txHash },
-            message: `Swap of ${amount} tokens submitted. Awaiting confirmation... View on explorer: ${abbreviateTransactionHash(txHash)}`,
+            message: `Swap of ${amount} tokens submitted. Awaiting confirmation... View on explorer: ${abbreviateTransactionHash(txHash || '')}`,
           });
           
           setStatus(
@@ -488,7 +1219,7 @@ export default function DashboardPage() {
                   target="_blank"
                   rel="noreferrer"
                 >
-                  View on Explorer: {abbreviateTransactionHash(txHash)}
+                  View on Explorer: {abbreviateTransactionHash(txHash || '')}
                 </a>
               </div>
             </div>
@@ -506,7 +1237,7 @@ export default function DashboardPage() {
           updateTransactionInHistory(historyId, {
             status: "completed",
             data: { transactionHash: receipt.transactionHash },
-            message: `Successfully swapped ${amount} tokens on ${chain}! View on explorer: ${abbreviateTransactionHash(receipt.transactionHash)}`,
+            message: `Successfully swapped ${amount} tokens on ${chain}! View on explorer: ${abbreviateTransactionHash(receipt.transactionHash || '')}`,
           });
           
           setStatus(
@@ -520,7 +1251,7 @@ export default function DashboardPage() {
                   target="_blank"
                   rel="noreferrer"
                 >
-                  View on Explorer: {abbreviateTransactionHash(receipt.transactionHash)}
+                  View on Explorer: {abbreviateTransactionHash(receipt.transactionHash || '')}
                 </a>
               </div>
             </div>
@@ -739,6 +1470,177 @@ export default function DashboardPage() {
         setShowStatusPopup(true);
         setLoading(false);
       }
+    } else if (data.transaction_type === "remittance") {
+      const { amount, recipient_address, chain } = data.response;
+      
+      try {
+        // Check network connectivity first
+        await checkNetwork(chain);
+        
+        console.log("🔄 Starting new remittance process - clearing previous data");
+        // IMPORTANT: Clear any existing remittance flow data from localStorage
+        localStorage.removeItem("brinco_remittance_flow");
+        
+        console.log("⬆️ Resetting to step 1");
+        // Reset the current step to 1 and clear any previous remittance data
+        setCurrentRemittanceStep(1);
+        
+        // Store the remittance flow data for processing
+        setRemittanceFlowData(data.response);
+        
+        // Store the remittance cost simulation data
+        if (data.response.cost_simulation) {
+          setRemittanceCost(data.response.cost_simulation);
+          setShowCostSimulation(true);
+        }
+        
+        // Add to history as pending
+        const historyId = `tx-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+        addTransactionToHistory({
+          type: "remittance",
+          status: "pending",
+          data: { 
+            chain, 
+            amount: amount.toString(), 
+            recipientAddress: recipient_address,
+            exchangeRates: data.response.cost_simulation?.exchange_rates,
+            fees: data.response.cost_simulation?.fees
+          },
+          message: `Starting remittance of $${amount} to ${recipient_address} on ${chain}...`,
+        });
+        
+        // Get the transaction flow steps
+        const transactionFlow = data.response.transaction_flow;
+        const totalSteps = Object.keys(transactionFlow).length;
+        
+        // If using test tokens, check initial balances
+        if (data.response.using_test_tokens && data.response.token_addresses && wallets[0]?.address) {
+          await checkTokenBalance(data.response.token_addresses.tUSD, wallets[0].address);
+          await checkTokenBalance(data.response.token_addresses.tEUR, wallets[0].address);
+        }
+        
+        // Display the initial status with cost simulation
+        setStatus(
+          <div className="text-center">
+            <h3 className="text-xl font-semibold mb-4">Remittance Process</h3>
+            <div className="bg-secondary/20 p-4 rounded-lg mb-4">
+              <p className="mb-2">Remittance flow initialized with {totalSteps} steps.</p>
+              {data.response.using_test_tokens && (
+                <p className="text-yellow-400 text-sm mb-2">Using test tokens (tUSD and tEUR) for simulation.</p>
+              )}
+              <div className="mt-4">
+                <button 
+                  onClick={() => setShowCostSimulation(!showCostSimulation)}
+                  className="text-primary hover:text-primary/80 underline"
+                >
+                  {showCostSimulation ? "Hide Cost Simulation" : "Show Cost Simulation"}
+                </button>
+              </div>
+            </div>
+            
+            {showCostSimulation && remittanceCost && (
+              <div className="bg-gray-900 p-4 rounded-lg border border-gray-700 text-left mt-4">
+                <h4 className="text-lg font-medium text-primary mb-2">Remittance Cost Simulation</h4>
+                
+                <div className="grid grid-cols-2 gap-2 mt-4">
+                  <div className="text-gray-400">USD Amount:</div>
+                  <div className="text-right font-mono">${remittanceCost.usd_amount.toFixed(2)}</div>
+                  
+                  <div className="text-gray-400">EUR Amount:</div>
+                  <div className="text-right font-mono">€{remittanceCost.eur_amount.toFixed(2)}</div>
+                  
+                  <div className="text-gray-400">Exchange Rate:</div>
+                  <div className="text-right font-mono">
+                    1 USD ≈ {remittanceCost.exchange_rates.usdc_to_eurc.toFixed(4)} EUR
+                  </div>
+                  
+                  <div className="text-gray-400">Network Fee:</div>
+                  <div className="text-right font-mono">${remittanceCost.fees.network_fee_usd.toFixed(2)}</div>
+                  
+                  <div className="text-gray-400">Service Fee:</div>
+                  <div className="text-right font-mono">${remittanceCost.fees.service_fee_usd.toFixed(2)}</div>
+                  
+                  <div className="text-gray-400 font-medium">Total Cost:</div>
+                  <div className="text-right font-mono font-medium">${remittanceCost.fees.total_cost_usd.toFixed(2)}</div>
+                </div>
+                
+                <div className="mt-4 pt-4 border-t border-gray-700">
+                  <p className="text-sm text-gray-400">
+                    Cost simulation based on current market rates and estimated gas prices. 
+                    Actual costs may vary at the time of execution.
+                  </p>
+                </div>
+              </div>
+            )}
+            
+            {/* Display token balances if available */}
+            {Object.keys(tokenBalances).length > 0 && (
+              <div className="mt-4 p-4 bg-gray-900 rounded-lg border border-gray-800">
+                <h4 className="text-primary font-medium mb-2">Token Balances</h4>
+                <div className="grid grid-cols-2 gap-2">
+                  {Object.values(tokenBalances).map((token) => (
+                    <div key={token.address} className="flex justify-between items-center">
+                      <span>{token.symbol}:</span>
+                      <span className="font-mono">{parseFloat(token.balance).toFixed(4)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            
+            <div className="mt-6">
+              <button
+                onClick={() => {
+                  // Clear any existing flow data to ensure we start fresh
+                  localStorage.removeItem("brinco_remittance_flow");
+                  // Reset to step 1
+                  setCurrentRemittanceStep(1);
+                  // Show the process in the popup
+                  setShowStatusPopup(true);
+                  // Wait a bit to ensure state is updated before processing
+                  setTimeout(() => {
+                    processRemittanceFlow(data.response, 1);
+                  }, 100);
+                }}
+                className="btn-primary"
+              >
+                Begin Remittance Process
+              </button>
+            </div>
+          </div>
+        );
+        setShowStatusPopup(true);
+        setLoading(false);
+      } catch (error) {
+        console.error("Remittance failed:", error);
+        
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        setNetworkError(errorMessage);
+        
+        // Add failed transaction to history
+        addTransactionToHistory({
+          type: "remittance",
+          status: "failed",
+          data: { 
+            chain, 
+            amount: amount.toString(), 
+            recipientAddress: recipient_address 
+          },
+          message: `Remittance failed: ${errorMessage}`,
+        });
+        
+        setStatus(
+          <div className="text-center">
+            <h3 className="text-xl font-semibold mb-2 text-red-600">Remittance Failed</h3>
+            <div className="bg-red-50 p-4 rounded-lg">
+              <p className="mb-4">Unable to complete the remittance process.</p>
+              <p className="text-sm text-gray-600">{errorMessage}</p>
+            </div>
+          </div>
+        );
+        setShowStatusPopup(true);
+        setLoading(false);
+      }
     }
     
     // Clear the input after processing
@@ -761,6 +1663,7 @@ export default function DashboardPage() {
       case 'transfer': return '↗️';
       case 'swap': return '🔄';
       case 'buy': return '💰';
+      case 'remittance': return '💸';
       default: return '📝';
     }
   };
@@ -833,10 +1736,13 @@ export default function DashboardPage() {
                   <textarea
                     value={intentValue}
                     onChange={(e) => setIntentValue(e.target.value)}
-                    placeholder="How can I help you today? I support transfers, swaps, and buying crypto through your wallet."
+                    placeholder="How can I help you today? I support transfers, swaps, buying crypto, and remittances through your wallet."
                     className="custom-textarea"
                   />
-                  <div className="flex justify-end">
+                  <div className="flex justify-between items-center">
+                    <div className="flex items-center">
+                      {/* Removed the checkbox for using test tokens */}
+                    </div>
                     <button
                       onClick={queryIntent}
                       className={`btn-primary ${loading ? "opacity-70 cursor-not-allowed" : ""}`}
@@ -916,7 +1822,7 @@ export default function DashboardPage() {
                                   className="text-xs text-primary hover:underline mt-1 inline-flex items-center"
                                 >
                                   <span className="mr-1">Explorer:</span>
-                                  {abbreviateTransactionHash(tx.data.transactionHash)}
+                                  {abbreviateTransactionHash(tx.data.transactionHash || '')}
                                   <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
                                   </svg>
